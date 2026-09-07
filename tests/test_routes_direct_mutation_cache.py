@@ -328,6 +328,11 @@ def test_routes_mutation_coverage() -> None:
 
     # 5. reverse
     child.routes.reverse()
+    assert client.get("/v1/r2").status_code == 200
+
+    # 6. __imul__
+    child.routes *= 2
+    assert len(child.routes) == 4
     # It just reorders them, but it should bump version
     assert client.get("/v1/r1").status_code == 200
 

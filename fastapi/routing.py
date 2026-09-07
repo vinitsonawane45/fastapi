@@ -2253,7 +2253,7 @@ class _FrontendRouteGroup(BaseRoute):
                 scope["fastapi_function_astack"] = previous_function_astack
 
 
-class _RouteList(list):  # type: ignore[type-arg]
+class _RouteList(list[BaseRoute]):
     """
     A ``list`` subclass used for :attr:`APIRouter.routes` that automatically
     calls :meth:`APIRouter._mark_routes_changed` whenever the list is mutated
@@ -2305,7 +2305,12 @@ class _RouteList(list):  # type: ignore[type-arg]
         super().__delitem__(index)
         self._owner._mark_routes_changed()
 
-    def __iadd__(self, items: Any) -> "_RouteList":  # type: ignore[misc]
+    def __imul__(self, n: SupportsIndex) -> "_RouteList":
+        super().__imul__(n)
+        self._owner._mark_routes_changed()
+        return self
+
+    def __iadd__(self, items: Any) -> "_RouteList":  # type: ignore[misc,override]
         super().__iadd__(items)
         self._owner._mark_routes_changed()
         return self
@@ -2595,6 +2600,7 @@ class APIRouter(routing.Router):
         else:
             lifespan_context = lifespan
         self.lifespan_context = lifespan_context
+        self._routes_version = 0
 
         super().__init__(
             routes=routes,
@@ -2635,7 +2641,6 @@ class APIRouter(routing.Router):
         self.default_response_class = default_response_class
         self.generate_unique_id_function = generate_unique_id_function
         self.strict_content_type = strict_content_type
-        self._routes_version = 0
         self._low_priority_routes: list[BaseRoute] = []
         self._frontend_routes: _FrontendRouteGroup | None = None
 
@@ -2661,19 +2666,17 @@ class APIRouter(routing.Router):
         no copy is made.  Otherwise every element of *value* is kept and the
         collection is re-wrapped.  The route-version counter is bumped so
         that all :class:`_IncludedRouter` caches are invalidated on the next
-        request, **but only once** ``_routes_version`` has been initialised
-        (i.e. after :meth:`__init__` has progressed past that assignment).
+        request.
         """
+        if getattr(self, "_routes", None) is value:
+            return
+
         if isinstance(value, _RouteList) and value._owner is self:
             # Already the correct managed list – keep it as-is.
             self._routes = value
         else:
             self._routes = _RouteList(self, list(value))
-        # Guard: _routes_version is set *after* super().__init__() returns
-        # (which itself calls ``self.routes = ...``), so we must not call
-        # _mark_routes_changed() before the attribute exists.
-        if hasattr(self, "_routes_version"):
-            self._mark_routes_changed()
+        self._mark_routes_changed()
 
     def _mark_routes_changed(self) -> None:
         self._routes_version += 1
