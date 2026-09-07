@@ -2602,13 +2602,11 @@ class APIRouter(routing.Router):
             default=default,
             lifespan=lifespan_context,
         )
-        # Replace the plain list from Starlette with an instrumented subclass
-        # that automatically bumps _routes_version on every mutation.  This
-        # ensures that direct mutations of router.routes (e.g.
-        # router.routes.append(route)) are reflected in the cache keys used by
-        # _IncludedRouter.effective_candidates().
-        # NOTE: _routes_version is initialised below, so we defer constructing
-        # _RouteList until after it is set (lines further down in __init__).
+        # The ``routes`` property (defined below) intercepts every assignment
+        # to ``self.routes`` – including the one in Starlette's
+        # ``Router.__init__`` called above – and automatically wraps the value
+        # in a :class:`_RouteList`.  The setter skips ``_mark_routes_changed``
+        # until ``_routes_version`` is available, so the order below is safe.
         if prefix:
             assert prefix.startswith("/"), "A path prefix must start with '/'"
             assert not prefix.endswith("/"), (
@@ -2638,11 +2636,44 @@ class APIRouter(routing.Router):
         self.generate_unique_id_function = generate_unique_id_function
         self.strict_content_type = strict_content_type
         self._routes_version = 0
-        # Now that _routes_version exists, wrap self.routes so future
-        # direct mutations auto-invalidate the cache.
-        self.routes = _RouteList(self, self.routes)
         self._low_priority_routes: list[BaseRoute] = []
         self._frontend_routes: _FrontendRouteGroup | None = None
+
+    @property
+    def routes(self) -> list[BaseRoute]:
+        """The managed list of routes attached to this router.
+
+        Always returns a :class:`_RouteList` so that in-place mutations
+        (``append``, ``remove``, slice assignment, etc.) automatically
+        invalidate the :class:`_IncludedRouter` candidate caches.
+
+        Direct reassignment is also safe::
+
+            router.routes = [new_route]  # still an _RouteList afterwards
+        """
+        return self._routes
+
+    @routes.setter
+    def routes(self, value: Any) -> None:
+        """Replace the route list, wrapping it in :class:`_RouteList`.
+
+        If *value* is already the :class:`_RouteList` owned by this router
+        no copy is made.  Otherwise every element of *value* is kept and the
+        collection is re-wrapped.  The route-version counter is bumped so
+        that all :class:`_IncludedRouter` caches are invalidated on the next
+        request, **but only once** ``_routes_version`` has been initialised
+        (i.e. after :meth:`__init__` has progressed past that assignment).
+        """
+        if isinstance(value, _RouteList) and value._owner is self:
+            # Already the correct managed list – keep it as-is.
+            self._routes = value
+        else:
+            self._routes = _RouteList(self, list(value))
+        # Guard: _routes_version is set *after* super().__init__() returns
+        # (which itself calls ``self.routes = ...``), so we must not call
+        # _mark_routes_changed() before the attribute exists.
+        if hasattr(self, "_routes_version"):
+            self._mark_routes_changed()
 
     def _mark_routes_changed(self) -> None:
         self._routes_version += 1

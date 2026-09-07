@@ -336,3 +336,215 @@ def test_routes_mutation_coverage() -> None:
     # Sort by path
     child.routes.sort(key=lambda r: getattr(r, "path", ""))
     assert client.get("/v1/r3").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Tests: direct reassignment (router.routes = [...])
+# ---------------------------------------------------------------------------
+
+
+def test_routes_reassignment_type_is_route_list():
+    """
+    After ``router.routes = [...]`` the attribute must still be a
+    :class:`_RouteList`, not a plain :class:`list`.
+    """
+    from fastapi.routing import _RouteList
+
+    router = APIRouter()
+
+    @router.get("/a")
+    def _a() -> str:  # pragma: no cover
+        return "a"
+
+    router.routes = []
+    assert isinstance(router.routes, _RouteList), (
+        "router.routes must remain a _RouteList after direct reassignment"
+    )
+
+
+def test_routes_reassignment_new_route_reachable_after_cache_warmup():
+    """
+    Regression for the scenario reported by @BitWeaverDev:
+
+        warmup: 200
+        after reassignment, new route reachable? expected 200, got: 404
+
+    After the cache has been warmed by a first request, a direct reassignment
+    of ``child.routes`` must make the new routes reachable.
+    """
+    child = APIRouter()
+
+    @child.get("/old")
+    def route_old() -> str:  # pragma: no cover
+        return "old"
+
+    app = FastAPI()
+    app.include_router(child, prefix="/v1")
+    client = TestClient(app, raise_server_exceptions=True)
+
+    # Warm up the candidate-route cache.
+    warmup = client.get("/v1/old")
+    assert warmup.status_code == 200, f"warmup failed: {warmup.status_code}"
+
+    # Directly reassign routes with a new route.
+    new_route = _make_route("/new", "new")
+    child.routes = [new_route]
+
+    # New route must be reachable.
+    resp_new = client.get("/v1/new")
+    assert resp_new.status_code == 200, (
+        f"after reassignment, new route reachable? expected 200, got: {resp_new.status_code}"
+    )
+
+
+def test_routes_reassignment_old_route_gone_after_cache_warmup():
+    """
+    Regression for the scenario reported by @BitWeaverDev:
+
+        after reassignment, old route gone? expected 404, got: 200
+
+    After direct reassignment of ``child.routes``, the old routes must no
+    longer be reachable (stale ``_IncludedRouter`` caches must be cleared).
+    """
+    child = APIRouter()
+
+    @child.get("/old")
+    def route_old() -> str:  # pragma: no cover
+        return "old"
+
+    app = FastAPI()
+    app.include_router(child, prefix="/v1")
+    client = TestClient(app, raise_server_exceptions=True)
+
+    # Warm up.
+    assert client.get("/v1/old").status_code == 200
+
+    # Directly reassign routes – old route is NOT included.
+    new_route = _make_route("/new", "new")
+    child.routes = [new_route]
+
+    # Old route must be gone.
+    resp_old = client.get("/v1/old")
+    assert resp_old.status_code == 404, (
+        f"after reassignment, old route gone? expected 404, got: {resp_old.status_code}"
+    )
+
+
+def test_routes_reassignment_is_still_route_list_after_warmup():
+    """
+    Regression for the scenario reported by @BitWeaverDev:
+
+        routes is still _RouteList after reassignment? list
+
+    ``router.routes`` must be an ``_RouteList`` instance even after a warm
+    cache and a direct reassignment.
+    """
+    from fastapi.routing import _RouteList
+
+    child = APIRouter()
+
+    @child.get("/x")
+    def route_x() -> str:  # pragma: no cover
+        return "x"
+
+    app = FastAPI()
+    app.include_router(child, prefix="/v1")
+    client = TestClient(app, raise_server_exceptions=True)
+
+    # Warm up.
+    assert client.get("/v1/x").status_code == 200
+
+    # Reassign.
+    child.routes = [_make_route("/y", "y")]
+
+    assert isinstance(child.routes, _RouteList), (
+        f"routes is still _RouteList after reassignment? {type(child.routes).__name__}"
+    )
+
+
+def test_routes_reassignment_nested_router():
+    """
+    Direct reassignment on a nested (included) router must correctly
+    invalidate caches through the full inclusion chain.
+    """
+    child = APIRouter()
+
+    @child.get("/before")
+    def before() -> str:  # pragma: no cover
+        return "before"
+
+    app = FastAPI()
+    app.include_router(child, prefix="/v1")
+    client = TestClient(app, raise_server_exceptions=True)
+
+    # Warm up through two hops.
+    assert client.get("/v1/before").status_code == 200
+
+    # Replace child routes entirely.
+    child.routes = [_make_route("/after", "after")]
+
+    assert client.get("/v1/after").status_code == 200, (
+        "new route not reachable after reassignment through included router"
+    )
+    assert client.get("/v1/before").status_code == 404, (
+        "old route still reachable after reassignment through included router"
+    )
+
+
+def test_routes_slice_assignment_invalidates_cache():
+    """
+    Slice assignment (``router.routes[:] = [...]``) is handled by
+    ``_RouteList.__setitem__`` and must also invalidate the cache.
+    """
+    child = APIRouter()
+
+    @child.get("/alpha")
+    def alpha() -> str:  # pragma: no cover
+        return "alpha"
+
+    app = FastAPI()
+    app.include_router(child, prefix="/v1")
+    client = TestClient(app, raise_server_exceptions=True)
+
+    # Warm up.
+    assert client.get("/v1/alpha").status_code == 200
+
+    # Slice-assign to replace all routes.
+    child.routes[:] = [_make_route("/beta", "beta")]
+
+    assert client.get("/v1/beta").status_code == 200, (
+        "new route not reachable after slice assignment"
+    )
+    assert client.get("/v1/alpha").status_code == 404, (
+        "old route still reachable after slice assignment"
+    )
+
+
+def test_routes_reassignment_empty_list():
+    """
+    Assigning an empty list to ``router.routes`` must clear all routes and
+    leave ``router.routes`` as a :class:`_RouteList`.
+    """
+    from fastapi.routing import _RouteList
+
+    child = APIRouter()
+
+    @child.get("/existing")
+    def existing() -> str:  # pragma: no cover
+        return "existing"
+
+    app = FastAPI()
+    app.include_router(child, prefix="/v1")
+    client = TestClient(app, raise_server_exceptions=True)
+
+    # Warm up.
+    assert client.get("/v1/existing").status_code == 200
+
+    # Clear via reassignment.
+    child.routes = []
+
+    assert isinstance(child.routes, _RouteList)
+    assert len(child.routes) == 0
+    assert client.get("/v1/existing").status_code == 404, (
+        "route still reachable after routes reassigned to []"
+    )
